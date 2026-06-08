@@ -1,11 +1,122 @@
+#!/bin/bash
+# ════════════════════════════════════════════════════════════════
+# run-worker.sh — Levanta el worker del traffic-generator
+#
+# Uso:
+#   ./run-worker.sh                       # auto: usa hostname como nombre
+#   ./run-worker.sh worker-debian-2       # nombre personalizado
+#   ./run-worker.sh worker-debian-2 8080  # nombre + puerto
+# ════════════════════════════════════════════════════════════════
+set -e
+
+# ── Parametros (con defaults) ──────────────────────────────────
+NODE_NAME="${1:-worker-$(hostname)}"
+PORT="${2:-80}"
+IMAGE="trafficgen-sdn:latest"
+CONTAINER_NAME="trafficgen-worker"
+
+# ── Colores para output legible ────────────────────────────────
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; B='\033[0;34m'; N='\033[0m'
+
+# ── Detectar IP local automaticamente ──────────────────────────
+LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [ -z "$LOCAL_IP" ]; then
+    LOCAL_IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+fi
+if [ -z "$LOCAL_IP" ]; then
+    echo -e "${R}[ERROR]${N} No se pudo detectar la IP local."
+    echo "        Ejecuta manualmente: ip a"
+    exit 1
+fi
+
+echo -e "${B}════════════════════════════════════════════════════════${N}"
+echo -e "${B}  TrafficGen — Worker Launcher${N}"
+echo -e "${B}════════════════════════════════════════════════════════${N}"
+echo -e "${G}[*]${N} Nombre del nodo : ${NODE_NAME}"
+echo -e "${G}[*]${N} IP local        : ${LOCAL_IP}"
+echo -e "${G}[*]${N} Puerto          : ${PORT}"
+echo
+
+# ── Verificar que Docker este corriendo ────────────────────────
+if ! docker info >/dev/null 2>&1; then
+    echo -e "${R}[ERROR]${N} Docker no esta corriendo o no tienes permisos."
+    echo "        Solucion: systemctl start docker"
+    exit 1
+fi
+
+# ── Verificar que esten los archivos necesarios ────────────────
+for f in app.py Dockerfile requirements.txt; do
+    if [ ! -f "$f" ]; then
+        echo -e "${R}[ERROR]${N} Falta el archivo: $f"
+        echo "        Ejecuta este script desde el directorio del proyecto."
+        exit 1
+    fi
+done
+
+# ── Construir la imagen si no existe ───────────────────────────
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo -e "${Y}[!]${N} Imagen ${IMAGE} no encontrada. Construyendo..."
+    docker build -t "$IMAGE" .
+    echo -e "${G}[OK]${N} Imagen construida."
+    echo
+fi
+
+# ── Eliminar contenedor previo si existe ───────────────────────
+if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    echo -e "${Y}[!]${N} Eliminando contenedor previo..."
+    docker rm -f "$CONTAINER_NAME" >/dev/null
+fi
+
+# ── Verificar que el puerto no este ocupado ────────────────────
+if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+    echo -e "${Y}[!]${N} Puerto ${PORT} ocupado por otro servicio:"
+    ss -tlnp | grep ":${PORT} "
+    echo "        Detenlo o usa otro puerto: ./run-worker.sh ${NODE_NAME} 8080"
+    exit 1
+fi
+
+# ── Lanzar el worker ───────────────────────────────────────────
+echo -e "${G}[*]${N} Lanzando worker..."
 docker run -d \
-  --name trafficgen-worker \
-  --network host \
-  --cap-add=NET_RAW \
-  --ulimit nofile=65535:65535 \
-  --restart unless-stopped \
-  -e MODE=worker \
-  -e PORT=80 \
-  -e NODE_NAME=worker-nuevo \
-  -e LOCAL_IPS="192.168.10.99" \
-  trafficgen-sdn:latest
+    --name "$CONTAINER_NAME" \
+    --network host \
+    --cap-add=NET_RAW \
+    --ulimit nofile=65535:65535 \
+    --restart unless-stopped \
+    -e MODE=worker \
+    -e PORT="$PORT" \
+    -e NODE_NAME="$NODE_NAME" \
+    -e LOCAL_IPS="$LOCAL_IP" \
+    "$IMAGE" >/dev/null
+
+# ── Esperar a que arranque y verificar ─────────────────────────
+echo -e "${G}[*]${N} Esperando arranque..."
+for i in {1..10}; do
+    sleep 1
+    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+        break
+    fi
+done
+
+if curl -sf "http://localhost:${PORT}/health" >/dev/null; then
+    echo
+    echo -e "${G}════════════════════════════════════════════════════════${N}"
+    echo -e "${G}  ✓ Worker activo y respondiendo${N}"
+    echo -e "${G}════════════════════════════════════════════════════════${N}"
+    echo
+    curl -s "http://localhost:${PORT}/health" | sed 's/^/    /'
+    echo
+    echo
+    echo -e "${B}Para registrar este worker en el C2:${N}"
+    echo "    Agrega a WORKERS:  ${G}http://${LOCAL_IP}:${PORT}${N}"
+    echo
+    echo -e "${B}Comandos utiles:${N}"
+    echo "    Ver logs:    docker logs -f ${CONTAINER_NAME}"
+    echo "    Detener:     docker stop ${CONTAINER_NAME}"
+    echo "    Reiniciar:   docker restart ${CONTAINER_NAME}"
+    echo "    Estado:      curl http://localhost:${PORT}/health"
+else
+    echo -e "${R}[ERROR]${N} El worker no responde tras 10 segundos."
+    echo "        Revisa los logs: docker logs ${CONTAINER_NAME}"
+    exit 1
+fi
