@@ -1,0 +1,11 @@
+docker run -d \
+  --name trafficgen-worker \
+  --network host \
+  --cap-add=NET_RAW \
+  --ulimit nofile=65535:65535 \
+  --restart unless-stopped \
+  -e MODE=worker \
+  -e PORT=80 \
+  -e NODE_NAME=worker-nuevo \
+  -e LOCAL_IPS="192.168.10.99" \
+  trafficgen-sdn:latest
